@@ -37,6 +37,7 @@ import nextflow.cloud.types.CloudInstanceType
 import nextflow.config.ConfigBuilder
 import nextflow.util.MemoryUnit
 import org.apache.commons.lang.SerializationUtils
+import spock.lang.Ignore
 import spock.lang.Specification
 import spock.lang.Unroll
 import spock.util.environment.RestoreSystemProperties
@@ -363,11 +364,22 @@ class AmazonCloudDriverTest extends Specification {
     def 'should create script to mount instance storage' () {
 
         given:
-        def driver = [:] as AmazonCloudDriver
+        def script
+        def driver = Spy(AmazonCloudDriver)
+
+        /*
+         * When it is provided `mount path` and `device name`
+         * It returns a script to format and mount that device
+         */
         when:
-        def snippet = driver.scriptMountInstanceStorage('/dev/xyz', '/mnt/scratch', 'ubuntu')
+        script = driver.scriptMountInstanceStorage('/mnt/scratch', '/dev/xyz', 'ubuntu', 'xx.123')
         then:
-        snippet ==  """
+        0 * driver.describeInstanceType(_) >> null
+        script ==  """
+                    # unmount any ephemeral volume
+                    for x in \$(df | grep ephemeral | awk '{print \$1}'); do umount \$x; done
+                    sed -i "/ephemeral/d" /etc/fstab
+                    # format and mount storage volume
                     mkfs.ext4 -E nodiscard /dev/xyz
                     mkdir -p /mnt/scratch
                     mount -o discard /dev/xyz /mnt/scratch
@@ -375,6 +387,65 @@ class AmazonCloudDriverTest extends Specification {
                     chmod 775 /mnt/scratch
                     """
                 .stripIndent().leftTrim()
+
+        /*
+         * When it is provided only the `mount path` it uses the `instanceType` to fetch
+         * the number of ephemeral instance storage volumes available.
+         * If it's just one, format and mount the volume as before
+         */
+        when:
+        script = driver.scriptMountInstanceStorage('/mnt/scratch', null, 'ubuntu', 'xx.123')
+        then:
+        1 * driver.describeInstanceType('xx.123') >> new CloudInstanceType(numOfDisks: 1)
+        script ==  """
+                    # unmount any ephemeral volume
+                    for x in \$(df | grep ephemeral | awk '{print \$1}'); do umount \$x; done
+                    sed -i "/ephemeral/d" /etc/fstab
+                    # format and mount storage volume
+                    mkfs.ext4 -E nodiscard /dev/sdb
+                    mkdir -p /mnt/scratch
+                    mount -o discard /dev/sdb /mnt/scratch
+                    chown -R ubuntu:ubuntu /mnt/scratch
+                    chmod 775 /mnt/scratch
+                    """
+                .stripIndent().leftTrim()
+
+        /*
+         * when the instanceType has more than one ephemeral instance storage volumes available
+         * it creates a LVM volume and mount that volume
+         */
+        when:
+        script = driver.scriptMountInstanceStorage('/mnt/scratch', null, 'ubuntu', 'xx.123')
+        then:
+        1 * driver.describeInstanceType('xx.123') >> new CloudInstanceType(numOfDisks: 4)
+        script ==  """
+                    # unmount any ephemeral volume
+                    for x in \$(df | grep ephemeral | awk '{print \$1}'); do umount \$x; done
+                    sed -i "/ephemeral/d" /etc/fstab
+                    # install LVM2
+                    command -v vgscan >/dev/null 2>&1 || yum install -y lvm2 || apt-get -y install lvm2
+                    # create lvm volume
+                    pvcreate -y /dev/sdb /dev/sdc /dev/sdd /dev/sde
+                    vgcreate -y eph /dev/sdb /dev/sdc /dev/sdd /dev/sde
+                    vgscan
+                    lvcreate -y -n data -l 100%FREE eph
+                    # format and mount storage volume
+                    mkfs.ext4 -E nodiscard /dev/eph/data
+                    mkdir -p /mnt/scratch
+                    mount -o discard /dev/eph/data /mnt/scratch
+                    chown -R ubuntu:ubuntu /mnt/scratch
+                    chmod 775 /mnt/scratch
+                    """
+                .stripIndent().leftTrim()
+
+        /*
+         *
+         */
+        when:
+        script = driver.scriptMountInstanceStorage('/mnt/scratch', null, 'ubuntu', 'xx.123')
+        then:
+        1 * driver.describeInstanceType('xx.123') >> new CloudInstanceType(id: 'xx.123')
+        script == null
     }
 
     def 'should create script to mount EFS storage' () {
@@ -428,7 +499,7 @@ class AmazonCloudDriverTest extends Specification {
         def driver = Spy(AmazonCloudDriver)
         driver.scriptMountEFS(_,_,_) >> { "mount efs" }
         driver.scriptCreateUser(_,_) >> { "create user" }
-        driver.scriptMountInstanceStorage(_,_,_) >> { "mount storage" }
+        driver.scriptMountInstanceStorage(_,_,_,_) >> { "mount storage" }
 
         when:
         // no user to create
@@ -444,7 +515,7 @@ class AmazonCloudDriverTest extends Specification {
         then:
         0 * driver.scriptCreateUser(_,_)
         0 * driver.scriptMountEFS(_, _, _)
-        0 * driver.scriptMountInstanceStorage(_,_,_)
+        0 * driver.scriptMountInstanceStorage(_,_,_,_)
         result1 == ''
 
 
@@ -457,7 +528,7 @@ class AmazonCloudDriverTest extends Specification {
         then:
         1 * driver.scriptCreateUser("ubuntu","ssh-hash 89d98ds090f06da67da")
         0 * driver.scriptMountEFS(_, _, _)
-        0 * driver.scriptMountInstanceStorage(_,_,_)
+        0 * driver.scriptMountInstanceStorage(_,_,_,_)
 
 
         when:
@@ -472,7 +543,7 @@ class AmazonCloudDriverTest extends Specification {
         driver.cloudBootHookScript(CloudConfig.create(config3).build())
         then:
         0 * driver.scriptCreateUser(_,_)
-        0 * driver.scriptMountInstanceStorage(_,_,_)
+        0 * driver.scriptMountInstanceStorage(_,_,_,_)
         1 * driver.scriptMountEFS('fs-213', '/mnt/efs', 'the-user')
 
 
@@ -489,12 +560,28 @@ class AmazonCloudDriverTest extends Specification {
         driver.cloudBootHookScript(CloudConfig.create(config4).build())
         then:
         0 * driver.scriptCreateUser(_,_)
-        1 * driver.scriptMountInstanceStorage('/dev/xyz','/mnt/scratch', 'the-user')
+        1 * driver.scriptMountInstanceStorage('/mnt/scratch', '/dev/xyz', 'the-user',_)
         0 * driver.scriptMountEFS(_, _, _)
 
     }
 
+    def 'should return a list of device names' () {
 
+        given:
+        def driver = Spy(AmazonCloudDriver)
+        expect:
+        driver.getInstanceStorageDeviceNames(1) == ['/dev/sdb']
+        driver.getInstanceStorageDeviceNames(2) == ['/dev/sdb', '/dev/sdc']
+        driver.getInstanceStorageDeviceNames(4) == ['/dev/sdb', '/dev/sdc', '/dev/sdd','/dev/sde']
+
+        when:
+        driver.getInstanceStorageDeviceNames(0)
+        then:
+        thrown(IllegalArgumentException)
+    }
+
+
+    @Ignore
     @Unroll
     def 'should get instance type description #type' () {
 

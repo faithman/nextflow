@@ -87,6 +87,7 @@ class AmazonCloudDriver implements CloudDriver {
 
     private String region
 
+
     AmazonCloudDriver() {
         this(Collections.emptyMap())
     }
@@ -215,10 +216,34 @@ class AmazonCloudDriver implements CloudDriver {
         .stripIndent()
     }
 
-    @PackageScope
-    String scriptMountInstanceStorage(String devicePath, String mountPath, String user) {
+    private String unmountEphemeralVolume() {
+        """\
+        # unmount any ephemeral volume
+        for x in \$(df | grep ephemeral | awk '{print \$1}'); do umount \$x; done
+        sed -i "/ephemeral/d" /etc/fstab
+        """
+        .stripIndent()
+    }
+
+    private String createLogicalVolume(List<String> devicePaths, String volumeGroup, String volumeName) {
+        assert devicePaths?.size()>1, "Device names should contain at least entries"
 
         """\
+        # install LVM2
+        command -v vgscan >/dev/null 2>&1 || yum install -y lvm2 || apt-get -y install lvm2
+        # create lvm volume
+        pvcreate -y ${devicePaths.join(' ')}
+        vgcreate -y $volumeGroup ${devicePaths.join(' ')}
+        vgscan
+        lvcreate -y -n $volumeName -l 100%FREE $volumeGroup
+        """
+        .stripIndent()
+
+    }
+
+    private String mountStorageVolume(String mountPath, String devicePath, String user) {
+        """\
+        # format and mount storage volume
         mkfs.ext4 -E nodiscard $devicePath
         mkdir -p $mountPath
         mount -o discard $devicePath $mountPath
@@ -226,6 +251,55 @@ class AmazonCloudDriver implements CloudDriver {
         chmod 775 $mountPath
         """
         .stripIndent()
+    }
+
+    @PackageScope
+    String scriptMountInstanceStorage(String mountPath, String devicePath, String user, String instanceType) {
+        assert mountPath
+        assert user
+
+        def result = unmountEphemeralVolume()
+        if( devicePath ) {
+            result += mountStorageVolume(mountPath, devicePath, user)
+            return result
+        }
+
+        def instance = describeInstanceType(instanceType)
+        if( !instance || instance.numOfDisks<0 ) {
+            log.warn "Unable to describe EC2 instance type: $instanceType -- skipping instance storage mount"
+            return null
+        }
+
+        if( instance.numOfDisks==0 ) {
+            log.warn "EC2 instance type `$instanceType` does not provide any ephemeral storage -- skipping instance storage mount"
+            return null
+        }
+
+        def names = getInstanceStorageDeviceNames(instance.numOfDisks)
+        if( names.size()==1 ) {
+            result += mountStorageVolume(mountPath, names[0], user)
+            return result
+        }
+        else {
+            result += createLogicalVolume(names, 'eph', 'data')
+            result += mountStorageVolume(mountPath, '/dev/eph/data', user)
+        }
+        return result
+    }
+
+    @PackageScope
+    List<String> getInstanceStorageDeviceNames(int numOfDisks) {
+        if( numOfDisks<=0 )
+            throw new IllegalArgumentException("Argument numOfDisks must be greater than zero")
+        // instance storage device names always starts from `/dev/sdb
+        // see http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html#device-name-limits`
+        final int BASE = 'b' as char
+        def names = []
+        for( int i=0; i<numOfDisks; i++ ) {
+            names << "/dev/sd${(BASE+i) as char}"
+        }
+
+        return names
     }
 
     @PackageScope
@@ -318,15 +392,16 @@ class AmazonCloudDriver implements CloudDriver {
             builder << scriptMountEFS(cfg.sharedStorageId, cfg.sharedStorageMount, cfg.userName)
         }
 
-        if( cfg.instanceStorageDevice && cfg.instanceStorageMount && cfg.instanceType ==~ '^(r3|h1)\\..+') {
-            builder << scriptMountInstanceStorage(cfg.instanceStorageDevice, cfg.instanceStorageMount, cfg.userName)
+        if( cfg.instanceStorageMount ) {
+            builder << scriptMountInstanceStorage(cfg.instanceStorageMount, cfg.instanceStorageDevice, cfg.userName, cfg.instanceType)
         }
 
         if( builder ) {
             builder.add(0, '#!/bin/bash')
         }
 
-        builder.join('\n')
+        // note: `findAll` remove all empty strings
+        builder.findAll().join('\n')
     }
 
     private byte[] getUserData0( LaunchConfig cfg ) {
