@@ -183,6 +183,25 @@ class AmazonCloudDriver implements CloudDriver {
         return result
     }
 
+    @Memoized // declare it has memoized to avoid to warn multiple times for the same warning message
+    @PackageScope
+    boolean hasInstanceStorage(LaunchConfig cfg) {
+        hasInstanceStorage0(cfg)
+    }
+
+    @PackageScope
+    boolean hasInstanceStorage0(LaunchConfig cfg) {
+        if( !cfg.instanceStorageMount )
+            return false
+
+        final type = cfg.instanceType
+        final hasDisks = describeInstanceType(type).numOfDisks > 0
+        if( !hasDisks ) {
+            log.warn "EC2 instance type: $type does not provide any ephemeral storage -- skipping instance storage mount"
+        }
+        return hasDisks
+    }
+
     @PackageScope
     String scriptCreateUser(String userName, String key) {
         """\
@@ -254,9 +273,10 @@ class AmazonCloudDriver implements CloudDriver {
     }
 
     @PackageScope
-    String scriptMountInstanceStorage(String mountPath, String devicePath, String user, String instanceType) {
-        assert mountPath
-        assert user
+    String scriptMountInstanceStorage(LaunchConfig cfg) {
+        final mountPath = cfg.getInstanceStorageMount()
+        final devicePath = cfg.getInstanceStorageDevice()
+        final user = cfg.getUserName()
 
         def result = unmountEphemeralVolume()
         if( devicePath ) {
@@ -264,18 +284,9 @@ class AmazonCloudDriver implements CloudDriver {
             return result
         }
 
-        def instance = describeInstanceType(instanceType)
-        if( !instance || instance.numOfDisks<0 ) {
-            log.warn "Unable to describe EC2 instance type: $instanceType -- skipping instance storage mount"
-            return null
-        }
+        def names = getInstanceStorageDeviceNames(cfg)
+        if( !names ) throw new IllegalStateException('Instance storage device names cannot be empty')
 
-        if( instance.numOfDisks==0 ) {
-            log.warn "EC2 instance type `$instanceType` does not provide any ephemeral storage -- skipping instance storage mount"
-            return null
-        }
-
-        def names = getInstanceStorageDeviceNames(instance.numOfDisks)
         if( names.size()==1 ) {
             result += mountStorageVolume(mountPath, names[0], user)
             return result
@@ -301,6 +312,16 @@ class AmazonCloudDriver implements CloudDriver {
 
         return names
     }
+
+    @PackageScope
+    List<String> getInstanceStorageDeviceNames(LaunchConfig cfg) {
+        final device = cfg.instanceStorageDevice
+        if( device )
+            return [device]
+        final num = describeInstanceType(cfg.instanceType).numOfDisks
+        return num ? getInstanceStorageDeviceNames(num) : Collections.<String>emptyList()
+    }
+
 
     @PackageScope
     String scriptBashEnv( LaunchConfig cfg ) {
@@ -392,8 +413,8 @@ class AmazonCloudDriver implements CloudDriver {
             builder << scriptMountEFS(cfg.sharedStorageId, cfg.sharedStorageMount, cfg.userName)
         }
 
-        if( cfg.instanceStorageMount ) {
-            builder << scriptMountInstanceStorage(cfg.instanceStorageMount, cfg.instanceStorageDevice, cfg.userName, cfg.instanceType)
+        if( hasInstanceStorage(cfg) ) {
+            builder << scriptMountInstanceStorage(cfg)
         }
 
         if( builder ) {
@@ -401,7 +422,7 @@ class AmazonCloudDriver implements CloudDriver {
         }
 
         // note: `findAll` remove all empty strings
-        builder.findAll().join('\n')
+        builder.join('\n')
     }
 
     private byte[] getUserData0( LaunchConfig cfg ) {
@@ -416,7 +437,9 @@ class AmazonCloudDriver implements CloudDriver {
         multipart.addBodyPart(script1)
 
         //
-        // second part mount the instance and EFS storage
+        // Second part mount the instance and EFS storage
+        // When using Amazon Linux this script is uploaded
+        // at this path: /var/lib/cloud/instance/boothooks/part-002
         //
         def text = cloudBootHookScript(cfg)
         if( text ) {
@@ -441,19 +464,23 @@ class AmazonCloudDriver implements CloudDriver {
         def result = new ArrayList<BlockDeviceMapping>()
 
         // -- map the ephemeral storage
-        if( cfg.instanceStorageDevice ) {
-            def mapping = new BlockDeviceMapping()
-            mapping.deviceName = cfg.instanceStorageDevice
-            mapping.virtualName = 'ephemeral0'
-            result << mapping
+        if( hasInstanceStorage(cfg) ) {
+            final deviceNames = getInstanceStorageDeviceNames(cfg)
+            for( int i=0; i<deviceNames.size(); i++ ) {
+                def mapping = new BlockDeviceMapping()
+                mapping.deviceName = deviceNames[i]
+                mapping.virtualName = "ephemeral$i"
+                result << mapping
+            }
         }
 
         // -- resize the boot storage
-        if( cfg.bootStorageSize ) {
+        final size = cfg.bootStorageSize
+        if( size ) {
             def rootDevice = getRooDeviceMapping( cfg.imageId )
-            rootDevice.ebs.volumeSize = (int)cfg.bootStorageSize.toGiga()
+            rootDevice.ebs.volumeSize = (int)size.toGiga()
             rootDevice.ebs.encrypted = null // <-- note: reset to null the encrypted flag
-            log.debug "Root EBS device: ${rootDevice.ebs}"
+            log.trace "Root EBS device: ${rootDevice.ebs}"
             result << rootDevice
         }
 
@@ -798,6 +825,9 @@ class AmazonCloudDriver implements CloudDriver {
     /**
      * Describe an instance type by the given type
      *
+     * Note: it's declared as Memoized to avoid to make a remote API call
+     * for each invocation
+     *
      * @param instanceType The instance type ID e.g. m3.2xlarge
      * @return
      *      The {@link CloudInstanceType} instance for the given
@@ -805,7 +835,12 @@ class AmazonCloudDriver implements CloudDriver {
      */
     @Memoized
     CloudInstanceType describeInstanceType( String instanceType ) {
-        new AmazonPriceReader(region).getInstanceType(instanceType)
+        createReader(region).getInstanceType(instanceType)
+    }
+
+    @PackageScope
+    AmazonPriceReader createReader(String region) {
+        new AmazonPriceReader(region)
     }
 
 }
