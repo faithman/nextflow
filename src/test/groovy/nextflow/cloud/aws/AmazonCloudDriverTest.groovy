@@ -354,6 +354,7 @@ class AmazonCloudDriverTest extends Specification {
                     # unmount any ephemeral volume
                     for x in \$(df | grep ephemeral | awk '{print \$1}'); do umount \$x; done
                     sed -i "/ephemeral/d" /etc/fstab
+                    sed -i "/ephemeral/d" /etc/cloud/cloud.cfg
                     # format and mount storage volume
                     mkfs.ext4 -E nodiscard /dev/xyz
                     mkdir -p /mnt/scratch
@@ -387,6 +388,7 @@ class AmazonCloudDriverTest extends Specification {
                     # unmount any ephemeral volume
                     for x in \$(df | grep ephemeral | awk '{print \$1}'); do umount \$x; done
                     sed -i "/ephemeral/d" /etc/fstab
+                    sed -i "/ephemeral/d" /etc/cloud/cloud.cfg
                     # format and mount storage volume
                     mkfs.ext4 -E nodiscard /dev/sdx
                     mkdir -p /scratch
@@ -419,6 +421,7 @@ class AmazonCloudDriverTest extends Specification {
                     # unmount any ephemeral volume
                     for x in \$(df | grep ephemeral | awk '{print \$1}'); do umount \$x; done
                     sed -i "/ephemeral/d" /etc/fstab
+                    sed -i "/ephemeral/d" /etc/cloud/cloud.cfg
                     # install LVM2
                     command -v vgscan >/dev/null 2>&1 || yum install -y lvm2 || apt-get -y install lvm2
                     # create lvm volume

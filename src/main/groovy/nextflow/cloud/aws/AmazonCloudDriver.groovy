@@ -240,6 +240,7 @@ class AmazonCloudDriver implements CloudDriver {
         # unmount any ephemeral volume
         for x in \$(df | grep ephemeral | awk '{print \$1}'); do umount \$x; done
         sed -i "/ephemeral/d" /etc/fstab
+        sed -i "/ephemeral/d" /etc/cloud/cloud.cfg
         """
         .stripIndent()
     }
